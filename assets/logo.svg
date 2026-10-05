@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="title">
+  <title id="title">Claude Freeze</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#123B6B"/>
+      <stop offset="1" stop-color="#2E8BE0"/>
+    </linearGradient>
+    <radialGradient id="frost" cx="0.3" cy="0.2" r="0.8">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <g id="arm" fill="none" stroke="#F4FAFF" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="64" y1="64" x2="64" y2="19" stroke-width="7"/>
+      <polyline points="53,28 64,38 75,28" stroke-width="5"/>
+    </g>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <rect width="128" height="128" rx="28" fill="url(#frost)"/>
+  <use href="#arm" xlink:href="#arm"/>
+  <use href="#arm" xlink:href="#arm" transform="rotate(60 64 64)"/>
+  <use href="#arm" xlink:href="#arm" transform="rotate(120 64 64)"/>
+  <use href="#arm" xlink:href="#arm" transform="rotate(180 64 64)"/>
+  <use href="#arm" xlink:href="#arm" transform="rotate(240 64 64)"/>
+  <use href="#arm" xlink:href="#arm" transform="rotate(300 64 64)"/>
+  <circle cx="64" cy="64" r="16" fill="#1C5C9E" stroke="#F4FAFF" stroke-width="4"/>
+  <rect x="57" y="57" width="4.5" height="14" rx="2" fill="#F4FAFF"/>
+  <rect x="66.5" y="57" width="4.5" height="14" rx="2" fill="#F4FAFF"/>
+</svg>

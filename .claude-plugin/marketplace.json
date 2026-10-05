@@ -1,0 +1,16 @@
+{
+  "name": "claude-freeze",
+  "owner": {
+    "name": "Franck Trouillez"
+  },
+  "metadata": {
+    "description": "Franck's Claude Code mods: freeze/resume a session"
+  },
+  "plugins": [
+    {
+      "name": "freeze",
+      "source": "./",
+      "description": "Freeze a Claude Code session at the next safe boundary and resume it later as if nothing happened"
+    }
+  ]
+}

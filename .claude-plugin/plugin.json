@@ -1,0 +1,33 @@
+{
+  "name": "freeze",
+  "version": "0.1.0",
+  "description": "Freeze a Claude Code session at the next safe boundary and resume it later as if nothing happened (ctrl+x f, /freeze)",
+  "author": {
+    "name": "Franck Trouillez"
+  },
+  "repository": "https://github.com/francktrouillez/claude-freeze",
+  "homepage": "https://github.com/francktrouillez/claude-freeze#readme",
+  "license": "MIT",
+  "keywords": [
+    "freeze",
+    "pause",
+    "resume",
+    "session",
+    "mod"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "shortcut": {
+      "type": "boolean",
+      "title": "ctrl+x f shortcut",
+      "description": "Show a one-line band above the prompt whose button toggles freeze, pressed by ctrl+x f once bound in ~/.claude/keybindings.json (see README). Off: use /freeze; the state shows in the status line.",
+      "default": false
+    },
+    "pauseBackground": {
+      "type": "boolean",
+      "title": "Pause background tasks",
+      "description": "Once a freeze has settled, pause (SIGSTOP) this session's background tasks (run_in_background commands, monitors, dev servers) and resume them on unfreeze. Off: they keep running while frozen.",
+      "default": true
+    }
+  }
+}
