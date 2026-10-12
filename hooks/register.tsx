@@ -14,6 +14,7 @@ const KEY_LABEL = 'ctrl+x f'
 const DIR = '"$HOME/.claude/freeze"'
 const FILE = `${DIR}/"$1.thaw"`
 const STOPPED = `${DIR}/"$1.stopped"`
+const STATE_FILE = `${DIR}/"$1.state"`
 const FREEZE_SH = `umask 077 && mkdir -p ${DIR} && rm -f ${FILE} && [ ! -e ${FILE} ]`
 const THAW_SH = `umask 077 && mkdir -p ${DIR} && touch ${FILE}`
 const WAIT_SH = `until [ -e ${FILE} ]; do sleep 1; done`
@@ -67,9 +68,21 @@ for f in ${DIR}/*.stopped; do
   rm -f "$f"
 done
 find ${DIR} -name '*.thaw' -mtime +7 -delete 2>/dev/null
+find ${DIR} -name '*.state' -mtime +30 -exec grep -qx running {} \\; -delete 2>/dev/null
+find ${DIR} -name '.state.*' -mmin +60 -delete 2>/dev/null
 echo "$n"`
 const CLEAN_SH = `${RESUME_SH}
 rm -f ${FILE}`
+// The session's phase ($2, one of three fixed words) for tools outside the
+// session. Written to a temporary file in the private folder,
+// then renamed over the state file, so a reader never sees half a word.
+const WRITE_STATE_SH = `case "$2" in running|freezing|frozen) ;; *) exit 2 ;; esac
+umask 077 && mkdir -p ${DIR} && chmod 700 ${DIR}
+tmp=$(mktemp ${DIR}/.state.XXXXXX) || exit 1
+if printf '%s\\n' "$2" > "$tmp" && mv -f "$tmp" ${STATE_FILE}; then exit 0; fi
+rm -f "$tmp"
+exit 1`
+const REMOVE_STATE_SH = `rm -f ${STATE_FILE}`
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/
 
 // Tools that only host other loops: their inner steps and tool calls are
@@ -109,6 +122,13 @@ const hhmm = (ms: number | null) =>
 
 const isSettled = (s: FreezeState) => s.isFrozen && s.running === 0
 
+// What ~/.claude/freeze/<session-id>.state says: `freezing` while in-flight
+// work settles, `frozen` once it is safe to disconnect, `running` otherwise.
+type Phase = 'running' | 'freezing' | 'frozen'
+
+const phaseOf = (s: FreezeState): Phase =>
+  !s.isFrozen ? 'running' : isSettled(s) ? 'frozen' : 'freezing'
+
 // One full line at a time: the spinner while a turn runs, else the band when
 // the shortcut is on, else the status line.
 function statusText(s: FreezeState) {
@@ -136,16 +156,63 @@ function frozenLine(s: FreezeState) {
   return `❄ Frozen since ${hhmm(s.since)} · safe to disconnect${paused} · ${toggleHint} to resume`
 }
 
+function queue() {
+  let tail: Promise<unknown> = Promise.resolve()
+
+  return <T,>(work: () => Promise<T>) => {
+    const run = tail.then(work)
+    tail = run.catch(() => undefined)
+
+    return run
+  }
+}
+
 // Pausing, resuming and toggling run one at a time, so a late pause can never
 // stop processes after a resume, and quick presses cannot interleave.
-let queue: Promise<unknown> = Promise.resolve()
+const serial = queue()
+// State file writes too, apart: a toggle waits on them, never the reverse.
+const serialStateFile = queue()
 
-function serial<T>(work: () => Promise<T>) {
-  const run = queue.then(work)
-  queue = run.catch(() => undefined)
+// The phase last sent to the state file, written or not. Undefined after a
+// (re)load or a session end, so the next change writes it; a failed write is
+// retried when the phase changes again, not on every tool call.
+let sentPhase: Phase | undefined
+let hasWarnedStateFile = false
+// The session that ended: work still settling as it closes must not write its
+// state file again once removed.
+let endedSessionId: string | undefined
 
-  return run
+// Writes the current phase, read when the write runs, so writes that queue up
+// end on the latest one. Never rejects: the file is for outside readers, and
+// must not fail a freeze, a resume or a tool call. A failure is shown once.
+function syncStateFile($: EngineInterface) {
+  return serialStateFile(async () => {
+    try {
+      const id = await $.session.id()
+      if (id === endedSessionId) {
+        return
+      }
+      endedSessionId = undefined
+      // Read again after each write, for a change that landed during it.
+      for (;;) {
+        const phase = phaseOf(await read($, state))
+        if (phase === sentPhase) {
+          return
+        }
+        sentPhase = phase
+        await shFor($, id, WRITE_STATE_SH, [phase])
+        hasWarnedStateFile = false
+      }
+    } catch (error) {
+      if (!hasWarnedStateFile) {
+        hasWarnedStateFile = true
+        $.ui.toast(`could not write the freeze state file (${reasonOf(error)})`)
+      }
+    }
+  })
 }
+
+const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 async function change($: EngineInterface, fn: (s: FreezeState) => FreezeState) {
   let before = IDLE
@@ -156,6 +223,9 @@ async function change($: EngineInterface, fn: (s: FreezeState) => FreezeState) {
     return fn(before)
   })
   $.ui.status(statusText(next))
+  if (phaseOf(next) !== sentPhase) {
+    await syncStateFile($)
+  }
   if (shouldPauseBackground && !isSettled(before) && isSettled(next)) {
     void serial(() => pauseBackground($))
   }
@@ -163,8 +233,7 @@ async function change($: EngineInterface, fn: (s: FreezeState) => FreezeState) {
   return next
 }
 
-async function sessionId($: EngineInterface) {
-  const id = await $.session.id()
+function checkSessionId(id: string) {
   if (!SESSION_ID.test(id)) {
     throw new Error(`unexpected session id ${JSON.stringify(id)}`)
   }
@@ -172,13 +241,23 @@ async function sessionId($: EngineInterface) {
   return id
 }
 
-async function sh($: EngineInterface, script: string) {
+async function sessionId($: EngineInterface) {
+  return checkSessionId(await $.session.id())
+}
+
+// Runs a fixed script with this session's id as $1 and `args` after it.
+async function sh($: EngineInterface, script: string, args: string[] = []) {
+  return shFor($, await $.session.id(), script, args)
+}
+
+async function shFor($: EngineInterface, id: string, script: string, args: string[] = []) {
   const { exitCode, stdout, stderr } = await $.process.run([
     'sh',
     '-c',
     script,
     'sh',
-    await sessionId($),
+    checkSessionId(id),
+    ...args,
   ])
   if (exitCode !== 0) {
     throw new Error(stderr.trim() || `exit ${exitCode}`)
@@ -281,20 +360,55 @@ async function bindShortcutKey($: EngineInterface) {
 
 type KeyBlock = { context?: string; bindings?: Record<string, string | null> }
 
-function toggle($: EngineInterface) {
-  return serial(async () => {
+type Outcome =
+  | { kind: 'froze' | 'resumed' | 'already-frozen' | 'not-frozen' }
+  | { kind: 'failed'; action: 'freeze' | 'resume'; reason: string }
+
+// `/freeze on` and `off` are idempotent: asking for the state the session is
+// already in (settling included) changes nothing. `undefined` toggles. The
+// state is read inside the queue, so quick requests see each other's result.
+function setFrozen($: EngineInterface, shouldFreeze?: boolean) {
+  return serial(async (): Promise<Outcome> => {
     const { isFrozen } = await read($, state)
+    const target = shouldFreeze ?? !isFrozen
+    if (target === isFrozen) {
+      return { kind: isFrozen ? 'already-frozen' : 'not-frozen' }
+    }
     try {
-      await (isFrozen ? thaw($) : freeze($))
+      await (target ? freeze($) : thaw($))
 
-      return !isFrozen
+      return { kind: target ? 'froze' : 'resumed' }
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error)
-      $.ui.toast(`could not ${isFrozen ? 'resume' : 'freeze'} (${reason})`)
-
-      return isFrozen
+      return { kind: 'failed', action: target ? 'freeze' : 'resume', reason: reasonOf(error) }
     }
   })
+}
+
+async function pressToggle($: EngineInterface) {
+  const outcome = await setFrozen($)
+  if (outcome.kind === 'failed') {
+    $.ui.toast(`could not ${outcome.action} (${outcome.reason})`)
+  }
+}
+
+async function outcomeText($: EngineInterface, outcome: Outcome) {
+  switch (outcome.kind) {
+    case 'froze':
+      return '❄ Freezing. Running work finishes, then everything parks. /freeze or /freeze off to resume.'
+    case 'resumed':
+      return 'Resumed.'
+    case 'not-frozen':
+      return 'Not frozen.'
+    case 'already-frozen': {
+      const s = await read($, state)
+
+      return isSettled(s)
+        ? 'Already frozen · safe to disconnect.'
+        : `Already freezing · ${s.running} still running.`
+    }
+    case 'failed':
+      return `Could not ${outcome.action} (${outcome.reason}).`
+  }
 }
 
 // Waits until resumed. The child is tied to the dispatch: Esc (`signal`)
@@ -400,7 +514,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'freeze',
       description: 'Freeze or resume this session at the next safe boundary',
-      argumentHint: '[shortcut on|off]',
+      argumentHint: '[on|off] · shortcut on|off',
       immediate: true,
     })
     // Fires again on every reload: counters from a previous load are stale,
@@ -418,26 +532,30 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
-    // Never leave background tasks stopped behind a closed session.
-    await sh($, CLEAN_SH).catch(() => undefined)
+    // Never leave background tasks stopped behind a closed session. The ending
+    // session's id is the event's: after a /clear the process goes on under
+    // another, whose state file is written on its next change.
+    await shFor($, e.sessionId, CLEAN_SH).catch(() => undefined)
+    await serialStateFile(async () => {
+      endedSessionId = e.sessionId
+      sentPhase = undefined
+      await shFor($, e.sessionId, REMOVE_STATE_SH).catch(() => undefined)
+    })
 
     return next(e)
   })
 
   on('command.run', { command: 'freeze' }, async ($, e) => {
-    const args = e.args.trim().toLowerCase()
+    const args = e.args.trim().toLowerCase().split(/\s+/).join(' ')
     if (args === 'shortcut on' || args === 'shortcut off') {
       return { text: await setShortcut($, args === 'shortcut on') }
     }
-    if (args !== '') {
-      return { text: 'Usage: /freeze (toggle) · /freeze shortcut on|off' }
+    if (args !== '' && args !== 'on' && args !== 'off') {
+      return { text: 'Usage: /freeze (toggle) · /freeze on|off · /freeze shortcut on|off' }
     }
+    const shouldFreeze = args === '' ? undefined : args === 'on'
 
-    return {
-      text: (await toggle($))
-        ? '❄ Freezing. Running work finishes, then everything parks. /freeze again to resume.'
-        : 'Resumed.',
-    }
+    return { text: await outcomeText($, await setFrozen($, shouldFreeze)) }
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -548,7 +666,7 @@ export const register: Register = (on, options) => {
           dimColor={!s.isFrozen}
           action={KEY_ACTION}
           label={label}
-          onPress={() => void toggle($)}
+          onPress={() => void pressToggle($)}
         />
       </Box>
     )

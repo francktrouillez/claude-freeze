@@ -7,13 +7,16 @@ const OK = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isSt
 
 // Stands in for the host. The freeze / thaw scripts clear and set the thaw
 // file, the spawned wait ends once it is set, as the real child does, and
-// every script and toast is recorded. `waitExit` is the wait child's exit
-// code (non-zero: the hold failed).
-function fakeHost(on: On, { waitExit = 0 } = {}) {
+// every script and toast is recorded, state file writes apart (their argv
+// whole). `waitExit` is the wait child's exit code (non-zero: the hold
+// failed); `failFreeze` makes the freeze script fail, `failStateWrite` every
+// state file write.
+function fakeHost(on: On, { waitExit = 0, failFreeze = false, failStateWrite = false } = {}) {
   let isThawed = true
   const waiters: (() => void)[] = []
   const scripts: string[] = []
   const toasts: string[] = []
+  const stateWrites: string[][] = []
   let markParked = () => {}
   const parked = new Promise<void>(resolve => {
     markParked = resolve
@@ -36,6 +39,11 @@ function fakeHost(on: On, { waitExit = 0 } = {}) {
       return { value: OK }
     }
     const script = e.argv[2] ?? ''
+    if (script.includes('mktemp')) {
+      stateWrites.push([...e.argv])
+
+      return { value: failStateWrite ? { ...OK, exitCode: 1, stderr: 'read-only file system' } : OK }
+    }
     if (script.includes('printf %s "$HOME"')) {
       return { value: { ...OK, stdout: '/home/test' } }
     }
@@ -53,6 +61,9 @@ function fakeHost(on: On, { waitExit = 0 } = {}) {
       waiters.splice(0).forEach(wake => wake())
     } else if (script.includes('rm -f')) {
       scripts.push('freeze')
+      if (failFreeze) {
+        return { value: { ...OK, exitCode: 1, stderr: 'disk full' } }
+      }
       isThawed = false
     }
 
@@ -67,7 +78,14 @@ function fakeHost(on: On, { waitExit = 0 } = {}) {
     return { value: { code: waitExit, signal: null } }
   })
 
-  return { parked, paused, scripts, toasts }
+  return {
+    parked,
+    paused,
+    scripts,
+    toasts,
+    stateWrites,
+    states: () => stateWrites.map(argv => argv[5]),
+  }
 }
 
 test('a tool call parks while frozen and runs once resumed', { timeoutMs: 10_000 }, async ($, on) => {
@@ -100,6 +118,130 @@ test('/freeze toggles', async ($, on) => {
 
   expect((await $.command.run(FREEZE)).text).toContain('Freezing')
   expect((await $.command.run(FREEZE)).text).toBe('Resumed.')
+})
+
+const ON = { command: 'freeze', args: 'on' } as CommandRunInput
+const OFF = { command: 'freeze', args: 'off' } as CommandRunInput
+
+test('/freeze on and /freeze off are idempotent', { options: { pauseBackground: false } }, async ($, on) => {
+  const host = fakeHost(on)
+
+  expect((await $.command.run(OFF)).text).toBe('Not frozen.')
+  expect((await $.command.run(ON)).text).toContain('Freezing')
+  expect((await $.command.run(ON)).text).toBe('Already frozen · safe to disconnect.')
+  expect((await $.command.run(OFF)).text).toBe('Resumed.')
+  expect((await $.command.run(OFF)).text).toBe('Not frozen.')
+
+  // One freeze, one resume (background tasks first, then the thaw file).
+  expect(host.scripts).toEqual(['freeze', 'resume', 'thaw'])
+})
+
+test('/freeze on while still settling never cancels the freeze', { timeoutMs: 10_000, options: { pauseBackground: false } }, async ($, on) => {
+  const host = fakeHost(on)
+  let finish = () => {}
+  const isFinished = new Promise<void>(resolve => {
+    finish = resolve
+  })
+  let markStarted = () => {}
+  const started = new Promise<void>(resolve => {
+    markStarted = resolve
+  })
+  on('tool.call', async () => {
+    markStarted()
+    await isFinished
+
+    return { result: 'ran' }
+  })
+
+  const call = $.tool.call({ tool: 'Bash', command: 'true' })
+  await started
+  await $.command.run(ON)
+  expect((await $.command.run(ON)).text).toBe('Already freezing · 1 still running.')
+  expect((await $.command.run({ command: 'freeze', args: ' ON ' } as CommandRunInput)).text).toContain('Already freezing')
+
+  finish()
+  expect((await call).result).toBe('ran')
+  expect(host.scripts).toEqual(['freeze'])
+})
+
+test('the state file follows running, freezing, frozen and running again', { timeoutMs: 10_000, options: { pauseBackground: false } }, async ($, on) => {
+  const host = fakeHost(on)
+  let finish = () => {}
+  const isFinished = new Promise<void>(resolve => {
+    finish = resolve
+  })
+  let markStarted = () => {}
+  const started = new Promise<void>(resolve => {
+    markStarted = resolve
+  })
+  on('tool.call', async () => {
+    markStarted()
+    await isFinished
+
+    return { result: 'ran' }
+  })
+
+  const call = $.tool.call({ tool: 'Bash', command: 'true' })
+  await started
+  await $.command.run(ON)
+  expect(host.states()).toEqual(['running', 'freezing'])
+
+  finish()
+  await call
+  expect(host.states()).toEqual(['running', 'freezing', 'frozen'])
+
+  await $.command.run(OFF)
+  expect(host.states()).toEqual(['running', 'freezing', 'frozen', 'running'])
+})
+
+test('state file writes run one fixed script, the session id and phase as arguments', { options: { pauseBackground: false } }, async ($, on) => {
+  const host = fakeHost(on)
+
+  await $.command.run(ON)
+  await $.command.run(OFF)
+
+  expect(host.stateWrites.length).toBeGreaterThan(0)
+  const scripts = new Set(host.stateWrites.map(argv => argv[2]))
+  expect(scripts.size).toBe(1)
+  for (const argv of host.stateWrites) {
+    expect(argv).toHaveLength(6)
+    expect(argv.slice(0, 2)).toEqual(['sh', '-c'])
+    expect(argv[4]).toBe('freeze-test')
+    expect(['running', 'freezing', 'frozen']).toContain(argv[5])
+  }
+})
+
+test('/freeze with anything else only shows the usage', async ($, on) => {
+  const host = fakeHost(on)
+
+  expect((await $.command.run({ command: 'freeze', args: 'onn' } as CommandRunInput)).text).toContain('Usage')
+  expect((await $.command.run({ command: 'freeze', args: 'on; rm -rf ~' } as CommandRunInput)).text).toContain('Usage')
+
+  expect(host.scripts).toEqual([])
+  expect(host.stateWrites).toEqual([])
+})
+
+test('a freeze that fails says so, and the session keeps running', async ($, on) => {
+  const host = fakeHost(on, { failFreeze: true })
+
+  expect((await $.command.run(ON)).text).toBe('Could not freeze (disk full).')
+  expect((await $.command.run(OFF)).text).toBe('Not frozen.')
+  expect(host.states()).not.toContain('frozen')
+})
+
+test('a state file that cannot be written warns once and never blocks a freeze', { options: { pauseBackground: false } }, async ($, on) => {
+  const host = fakeHost(on, { failStateWrite: true })
+  on('tool.call', () => ({ result: 'ran' }))
+
+  expect((await $.tool.call({ tool: 'Bash', command: 'true' })).result).toBe('ran')
+  expect((await $.tool.call({ tool: 'Bash', command: 'true' })).result).toBe('ran')
+  // One attempt for `running`, not one per tool call.
+  expect(host.states()).toEqual(['running'])
+
+  expect((await $.command.run(ON)).text).toContain('Freezing')
+  expect((await $.command.run(OFF)).text).toBe('Resumed.')
+  expect(host.states()).toEqual(['running', 'frozen', 'running'])
+  expect(host.toasts.filter(t => t.includes('state file'))).toHaveLength(1)
 })
 
 test('a failed hold fails open and clears the frozen state', { timeoutMs: 10_000 }, async ($, on) => {

@@ -17,7 +17,8 @@ without the live context.
 the session (subagents included) parks before its next step, and it tells you once
 nothing is talking to the network anymore, so you can close the lid or switch wifi.
 Run `/freeze` again and the turn continues exactly where it stopped, with nothing
-added to the conversation.
+added to the conversation. `/freeze on` and `/freeze off` do the same explicitly,
+for scripts and tools that drive sessions.
 
 The state shows on one line at a time: the spinner while a turn runs, otherwise the
 status line (or the band, with the optional shortcut):
@@ -47,6 +48,9 @@ status line (or the band, with the optional shortcut):
 - **Names the MCP servers that dropped.** If an MCP call fails on a lost connection
   shortly after you resume, a toast tells you which server to reconnect with `/mcp`.
 - **Per session.** Each Claude Code session freezes on its own.
+- **Readable from outside.** Each session's state (`running`, `freezing` or
+  `frozen`) is kept in a one-word file, so a tool that drives several sessions can
+  show it.
 
 ## Install
 
@@ -149,9 +153,10 @@ and is free at the prompt.
 | Action | How |
 | --- | --- |
 | Freeze / resume | `/freeze` (toggle); with the shortcut on, also `Ctrl+X F` or a click on the band |
+| Freeze / resume, explicitly | `/freeze on` / `/freeze off`: nothing happens when the session already is, so a script can send them safely |
 | Turn the shortcut on / off | `/freeze shortcut on` / `/freeze shortcut off` |
 | Know it is safe to disconnect | wait for `safe to disconnect` |
-| Cancel a freeze that is still settling | `/freeze` again |
+| Cancel a freeze that is still settling | `/freeze` or `/freeze off` (`/freeze on` keeps it) |
 | Abandon the parked turn | `Esc`: the parked step is dropped, never run later |
 
 `/freeze` works mid-turn (it is an *immediate* command), including where the shortcut
@@ -192,6 +197,14 @@ session followed from another device.
   that fails with a connection-type error (reset, timeout, not connected, 401)
   raises one toast per server: `MCP server "x" lost its connection while frozen,
   run /mcp to reconnect`.
+- **The state file.** `~/.claude/freeze/<session-id>.state` holds one word and a
+  newline: `running`, `freezing` (in-flight work still settling) or `frozen` (safe to
+  disconnect). It is rewritten only when that word changes, through a temporary file
+  renamed over it, so a reader never sees half a word. It is removed when the session
+  ends. No file means `running`. A session that crashes can leave its file behind, so
+  it only means something for a session that is still alive (leftover `running` files
+  are pruned after 30 days). If the file cannot be written, a toast says so once and
+  the freeze itself goes on.
 - **One line at a time.** The spinner carries the state while a turn runs; when
   idle, the band does (shortcut on) or else the status line.
 - **The band** (shortcut option only). A one-line band above the prompt carries the
@@ -203,7 +216,12 @@ session followed from another device.
 - It never changes a tool call or a model request. It only delays them, and drops
   a step you interrupt with `Esc` while frozen.
 - It runs a few fixed shell commands on your machine, and only signals the
-  background tasks of the session it runs in.
+  background tasks of the session it runs in. The session id and the state word are
+  passed to them as arguments, never spliced into the command, and both are checked
+  against a fixed pattern first.
+- Its files live in `~/.claude/freeze/`, kept private (`0700`, files `0600`), never
+  in a shared `/tmp`. The state file says only `running`, `freezing` or `frozen`:
+  nothing from the conversation.
 
 Found a vulnerability? Please report it privately through the repository's
 **Security** tab (**Report a vulnerability**) rather than in a public issue.
@@ -253,7 +271,7 @@ Files:
 hooks/hooks.json                 names the hooks module
 hooks/register.tsx               the mod
 types/index.d.ts                 the mod's state contract ($.state)
-tests/freeze.test.ts             park, resume, toggle, fail-open, background, MCP, spinner, band and shortcut-setup tests
+tests/freeze.test.ts             park, resume, toggle, on/off, state file, fail-open, background, MCP, spinner, band and shortcut-setup tests
 ```
 
 ## Contributing
