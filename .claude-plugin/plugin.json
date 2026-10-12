@@ -1,6 +1,6 @@
 {
   "name": "freeze",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Freeze a Claude Code session at the next safe boundary and resume it later as if nothing happened (ctrl+x f, /freeze)",
   "author": {
     "name": "Franck Trouillez"
